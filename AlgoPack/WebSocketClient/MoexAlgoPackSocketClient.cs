@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.WebSockets;
+using Newtonsoft.Json.Linq;
 
 public class MoexAlgoPackSocketClient(string url) : IAsyncDisposable
 {
@@ -30,24 +31,72 @@ public class MoexAlgoPackSocketClient(string url) : IAsyncDisposable
 		await _clientWebSocket.SendAsync(segment, WebSocketMessageType.Text, true, cancellationToken);
 	}
 
-	public async ValueTask ReceiveAsync(Action<string> received, CancellationToken cancellationToken = default)
+	public async ValueTask ReceiveAsync(Action<JObject> received, CancellationToken cancellationToken = default)
 	{
 		var buffer = new byte[1024 * 4];
+		var messageBuffer = new byte[buffer.Length];
+		var messageLength = 0;
 
 		while (_clientWebSocket.State == WebSocketState.Open)
 		{
-			var result = await _clientWebSocket.ReceiveAsync(new(buffer), cancellationToken);
+			var result = await _clientWebSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
 
-			if (result.MessageType == WebSocketMessageType.Close)
+			if (messageLength + result.Count > messageBuffer.Length)
 			{
-				await _clientWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, default);
+				Array.Resize(ref messageBuffer, Math.Max(messageBuffer.Length * 2, messageLength + result.Count));
 			}
-			else
+
+			Buffer.BlockCopy(buffer, 0, messageBuffer, messageLength, result.Count);
+			messageLength += result.Count;
+
+			if (result.EndOfMessage)
 			{
-				var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-				received(message);
+				if (result.MessageType == WebSocketMessageType.Close)
+				{
+					await _clientWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, cancellationToken);
+				}
+				else
+				{
+					var message = Encoding.UTF8.GetString(messageBuffer, 0, messageLength);
+					received(ParseStompMessage(message));
+				}
+
+				messageLength = 0;
 			}
 		}
+	}
+
+	private static JObject ParseStompMessage(string message)
+	{
+		var lines = message.Split('\n');
+		var headers = new JObject();
+		var bodyStart = 0;
+
+		for (int i = 0; i < lines.Length; i++)
+		{
+			if (string.IsNullOrWhiteSpace(lines[i]))
+			{
+				bodyStart = i + 1;
+				break;
+			}
+
+			var headerParts = lines[i].Split(':', 2);
+			if (headerParts.Length == 2)
+			{
+				headers[headerParts[0].Trim()] = headerParts[1].Trim();
+			}
+		}
+
+		var body = string.Join("\n", lines.Skip(bodyStart));
+		var bodyJson = JToken.Parse(body);
+
+		var result = new JObject
+		{
+			["headers"] = headers,
+			["body"] = bodyJson
+		};
+
+		return result;
 	}
 
 	public async ValueTask CloseAsync()
